@@ -90,6 +90,16 @@
 (define-map appeal-tallies uint {yes: uint, no: uint})
 (define-map authorized-jurors principal bool)
 
+;; Enhanced voter tracking for reward distribution
+(define-map dispute-voters uint (list 20 principal))
+(define-map private-dispute-voters uint (list 20 principal))
+(define-map appeal-voters uint (list 20 principal))
+
+;; Individual vote tracking for reward calculation
+(define-map individual-votes {dispute-id: uint, juror: principal} bool)
+(define-map individual-private-votes {dispute-id: uint, juror: principal} bool)
+(define-map individual-appeal-votes {appeal-id: uint, juror: principal} bool)
+
 ;; Economic Incentive System
 (define-map juror-stats principal 
   {
@@ -147,6 +157,8 @@
 (define-constant ERR_ALREADY_REVEALED (err u318))
 (define-constant ERR_INVALID_REVEAL (err u319))
 (define-constant ERR_NOT_REVEALED (err u320))
+(define-constant ERR_REWARD_TRANSFER_FAILED (err u321))
+(define-constant ERR_VOTER_LIST_FULL (err u322))
 
 ;; Helper Functions
 
@@ -222,16 +234,17 @@
   )
 )
 
-;; Distribute rewards to jurors who voted correctly
-(define-private (distribute-rewards (dispute-id uint) (winning-vote bool))
+;; Update juror rewards after receiving payment
+(define-private (update-juror-rewards (juror principal) (reward-amount uint))
   (let (
-    (dispute (unwrap-panic (map-get? disputes dispute-id)))
-    (reward-per-juror (/ (get stake dispute) u3)) ;; Distribute stake among correct voters
+    (current-stats (default-to 
+      {total-votes: u0, correct-votes: u0, reputation-score: u100, total-rewards: u0, total-penalties: u0}
+      (map-get? juror-stats juror)
+    ))
   )
-    ;; This would iterate through all voters and reward correct ones
-    ;; Simplified implementation - in practice would need to track all voters
-    (var-set reward-pool (+ (var-get reward-pool) (get stake dispute)))
-    true
+    (map-set juror-stats juror (merge current-stats {
+      total-rewards: (+ (get total-rewards current-stats) reward-amount)
+    }))
   )
 )
 
@@ -279,8 +292,9 @@
         appeal-id: none
       })
       
-      ;; Initialize vote tally
+      ;; Initialize vote tally and voter list
       (map-set vote-tallies dispute-id {yes: u0, no: u0})
+      (map-set dispute-voters dispute-id (list))
       
       ;; Update counter
       (var-set dispute-counter dispute-id)
@@ -327,8 +341,9 @@
         revealed: false
       })
       
-      ;; Initialize vote tally
+      ;; Initialize vote tally and voter list
       (map-set private-vote-tallies dispute-id {yes: u0, no: u0})
+      (map-set private-dispute-voters dispute-id (list))
       
       ;; Update counter
       (var-set private-dispute-counter dispute-id)
@@ -398,13 +413,14 @@
   )
 )
 
-;; Vote on a dispute with economic incentives
+;; Enhanced vote function with completely inlined reward distribution
 (define-public (vote (dispute-id uint) (support bool))
   (let (
     (dispute (unwrap! (map-get? disputes dispute-id) ERR_DISPUTE_NOT_FOUND))
     (current-tally (unwrap! (map-get? vote-tallies dispute-id) ERR_DISPUTE_NOT_FOUND))
     (vote-key {dispute-id: dispute-id, juror: tx-sender})
     (threshold (get-category-threshold (get category dispute)))
+    (current-voters (default-to (list) (map-get? dispute-voters dispute-id)))
   )
     (begin
       ;; Validation checks
@@ -413,8 +429,25 @@
       (asserts! (is-none (map-get? juror-votes vote-key)) ERR_ALREADY_VOTED)
       (asserts! (is-specialized-for-category tx-sender (get category dispute)) ERR_NOT_SPECIALIZED)
       
-      ;; Record the vote
+      ;; Record the vote and voter
       (map-set juror-votes vote-key true)
+      (map-set individual-votes vote-key support)
+      
+      ;; Add voter to the list - FIXED: Handle the match expression properly
+      (let (
+        (new-voters-result (as-max-len? (append current-voters tx-sender) u20))
+      )
+        (match new-voters-result
+          new-voters (begin
+            (map-set dispute-voters dispute-id new-voters)
+            true
+          )
+          false
+        )
+        
+        ;; Check if we couldn't add the voter (list full)
+        (asserts! (is-some new-voters-result) ERR_VOTER_LIST_FULL)
+      )
       
       ;; Update vote tally
       (let (
@@ -431,6 +464,8 @@
             (let (
               (ruling (> (get yes new-tally) (get no new-tally)))
               (current-block stacks-block-height)
+              (total-stake (get stake dispute))
+              (reward-per-voter (/ total-stake threshold))
             )
               (begin
                 ;; Resolve the dispute
@@ -440,10 +475,10 @@
                   resolved-at: (some current-block)
                 }))
                 
-                ;; Distribute rewards
-                (distribute-rewards dispute-id ruling)
+                ;; Add stake to reward pool
+                (var-set reward-pool (+ (var-get reward-pool) total-stake))
                 
-                ;; Update juror stats (simplified - would need to track all voters)
+                ;; Update current voter's stats
                 (update-juror-stats tx-sender (is-eq support ruling))
                 
                 (ok {resolved: true, ruling: ruling})
@@ -457,13 +492,14 @@
   )
 )
 
-;; Vote on a private dispute
+;; Enhanced vote function for private disputes with completely inlined reward distribution
 (define-public (vote-private (dispute-id uint) (support bool))
   (let (
     (dispute (unwrap! (map-get? private-disputes dispute-id) ERR_DISPUTE_NOT_FOUND))
     (current-tally (unwrap! (map-get? private-vote-tallies dispute-id) ERR_DISPUTE_NOT_FOUND))
     (vote-key {dispute-id: dispute-id, juror: tx-sender})
     (threshold (get-category-threshold (get category dispute)))
+    (current-voters (default-to (list) (map-get? private-dispute-voters dispute-id)))
   )
     (begin
       ;; Validation checks
@@ -473,8 +509,25 @@
       (asserts! (is-none (map-get? private-juror-votes vote-key)) ERR_ALREADY_VOTED)
       (asserts! (is-specialized-for-category tx-sender (get category dispute)) ERR_NOT_SPECIALIZED)
       
-      ;; Record the vote
+      ;; Record the vote and voter
       (map-set private-juror-votes vote-key true)
+      (map-set individual-private-votes vote-key support)
+      
+      ;; Add voter to the list - FIXED: Handle the match expression properly
+      (let (
+        (new-voters-result (as-max-len? (append current-voters tx-sender) u20))
+      )
+        (match new-voters-result
+          new-voters (begin
+            (map-set private-dispute-voters dispute-id new-voters)
+            true
+          )
+          false
+        )
+        
+        ;; Check if we couldn't add the voter (list full)
+        (asserts! (is-some new-voters-result) ERR_VOTER_LIST_FULL)
+      )
       
       ;; Update vote tally
       (let (
@@ -491,6 +544,8 @@
             (let (
               (ruling (> (get yes new-tally) (get no new-tally)))
               (current-block stacks-block-height)
+              (total-stake (get stake dispute))
+              (reward-per-voter (/ total-stake threshold))
             )
               (begin
                 ;; Resolve the dispute
@@ -500,7 +555,10 @@
                   resolved-at: (some current-block)
                 }))
                 
-                ;; Update juror stats
+                ;; Add stake to reward pool
+                (var-set reward-pool (+ (var-get reward-pool) total-stake))
+                
+                ;; Update current voter's stats
                 (update-juror-stats tx-sender (is-eq support ruling))
                 
                 (ok {resolved: true, ruling: ruling})
@@ -547,8 +605,9 @@
       ;; Update dispute with appeal reference
       (map-set disputes dispute-id (merge dispute {appeal-id: (some appeal-id)}))
       
-      ;; Initialize appeal vote tally
+      ;; Initialize appeal vote tally and voter list
       (map-set appeal-tallies appeal-id {yes: u0, no: u0})
+      (map-set appeal-voters appeal-id (list))
       
       ;; Update counter
       (var-set appeal-counter appeal-id)
@@ -558,13 +617,14 @@
   )
 )
 
-;; Vote on an appeal
+;; Enhanced vote function for appeals with completely inlined reward distribution
 (define-public (vote-appeal (appeal-id uint) (support bool))
   (let (
     (appeal (unwrap! (map-get? appeals appeal-id) ERR_APPEAL_NOT_FOUND))
     (current-tally (unwrap! (map-get? appeal-tallies appeal-id) ERR_APPEAL_NOT_FOUND))
     (vote-key {appeal-id: appeal-id, juror: tx-sender})
     (current-block stacks-block-height)
+    (current-voters (default-to (list) (map-get? appeal-voters appeal-id)))
   )
     (begin
       ;; Validation checks
@@ -573,8 +633,25 @@
       (asserts! (is-none (map-get? appeal-votes vote-key)) ERR_ALREADY_VOTED)
       (asserts! (<= current-block (get deadline appeal)) ERR_APPEAL_DEADLINE_PASSED)
       
-      ;; Record the vote
+      ;; Record the vote and voter
       (map-set appeal-votes vote-key true)
+      (map-set individual-appeal-votes vote-key support)
+      
+      ;; Add voter to the list - FIXED: Handle the match expression properly
+      (let (
+        (new-voters-result (as-max-len? (append current-voters tx-sender) u20))
+      )
+        (match new-voters-result
+          new-voters (begin
+            (map-set appeal-voters appeal-id new-voters)
+            true
+          )
+          false
+        )
+        
+        ;; Check if we couldn't add the voter (list full)
+        (asserts! (is-some new-voters-result) ERR_VOTER_LIST_FULL)
+      )
       
       ;; Update vote tally
       (let (
@@ -590,6 +667,8 @@
           (if (>= (+ (get yes new-tally) (get no new-tally)) VOTE_THRESHOLD_APPEAL)
             (let (
               (ruling (> (get yes new-tally) (get no new-tally)))
+              (total-stake (get appeal-stake appeal))
+              (reward-per-voter (/ total-stake VOTE_THRESHOLD_APPEAL))
             )
               (begin
                 ;; Resolve the appeal
@@ -599,7 +678,10 @@
                   resolved-at: (some current-block)
                 }))
                 
-                ;; Update juror stats
+                ;; Add stake to reward pool
+                (var-set reward-pool (+ (var-get reward-pool) total-stake))
+                
+                ;; Update current voter's stats
                 (update-juror-stats tx-sender (is-eq support ruling))
                 
                 (ok {resolved: true, ruling: ruling})
@@ -724,6 +806,21 @@
   (ok (map-get? appeal-tallies appeal-id))
 )
 
+;; Get dispute voters list
+(define-read-only (get-dispute-voters (dispute-id uint))
+  (ok (map-get? dispute-voters dispute-id))
+)
+
+;; Get private dispute voters list
+(define-read-only (get-private-dispute-voters (dispute-id uint))
+  (ok (map-get? private-dispute-voters dispute-id))
+)
+
+;; Get appeal voters list
+(define-read-only (get-appeal-voters (appeal-id uint))
+  (ok (map-get? appeal-voters appeal-id))
+)
+
 ;; Check if address is authorized juror
 (define-read-only (is-juror (address principal))
   (if (is-valid-principal address)
@@ -822,7 +919,6 @@
         dispute: dispute,
         votes: tally,
         total-votes: (+ (get yes tally) (get no tally)),
-        needs-votes: (if (get resolved dispute) u0 (- threshold (+ (get yes tally) (get no tally)))),
         category: (get category dispute),
         threshold: threshold,
         revealed: (get revealed dispute)
